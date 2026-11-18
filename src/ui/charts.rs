@@ -101,6 +101,44 @@ fn temperature_color(name: &str, idx: usize) -> Color32 {
     }
 }
 
+/// Formats tooltip text for both hovered series points and empty-space cursor positions.
+pub fn format_hover_label(
+    pos: &HoverPosition<'_>,
+    pct_lookup: &BTreeMap<String, f64>,
+    left_unit_suffix: &str,
+    cursor_right_axis_pct_scale: Option<f64>,
+    y_bounds: (f64, f64),
+) -> Option<String> {
+    match pos {
+        HoverPosition::NearDataPoint {
+            plot_name,
+            position,
+            ..
+        } if !plot_name.is_empty() => {
+            let time_str = format_local_time(position.x);
+            if let Some(&scale) = pct_lookup.get(*plot_name) {
+                let pct = if scale > 0.0 { position.y / scale } else { 0.0 };
+                Some(format!("{plot_name}: {pct:.1} %\n{time_str}"))
+            } else {
+                Some(format!(
+                    "{plot_name}: {:.2}{left_unit_suffix}\n{time_str}",
+                    position.y
+                ))
+            }
+        }
+        HoverPosition::Elsewhere { position } => {
+            let y = position.y.clamp(y_bounds.0, y_bounds.1);
+            if let Some(scale) = cursor_right_axis_pct_scale.filter(|&s| s > 0.0) {
+                let pct = (y / scale).clamp(0.0, 100.0);
+                Some(format!("{y:.2}{left_unit_suffix} · {pct:.1} %"))
+            } else {
+                Some(format!("{y:.2}{left_unit_suffix}"))
+            }
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_time_chart(
     ui: &mut Ui,
@@ -121,6 +159,7 @@ pub fn render_time_chart(
         .iter()
         .filter_map(|s| s.right_axis_pct_scale.map(|sc| (s.name.clone(), sc)))
         .collect();
+    let cursor_pct_scale = series.iter().find_map(|s| s.right_axis_pct_scale);
     let unit = left_unit_suffix.to_string();
 
     let mut max_visible_y = y_bounds_floor.1;
@@ -172,21 +211,8 @@ pub fn render_time_chart(
         .default_y_bounds(y_min, y_max)
         .custom_y_axes(y_axes)
         .x_axis_formatter(|mark: GridMark, _| format_local_time(mark.value))
-        .label_formatter(move |pos| match pos {
-            HoverPosition::NearDataPoint {
-                plot_name,
-                position,
-                ..
-            } if !plot_name.is_empty() => {
-                let time_str = format_local_time(position.x);
-                if let Some(&scale) = pct_lookup.get(*plot_name) {
-                    let pct = if scale > 0.0 { position.y / scale } else { 0.0 };
-                    Some(format!("{plot_name}: {pct:.1} %\n{time_str}"))
-                } else {
-                    Some(format!("{plot_name}: {:.2}{unit}\n{time_str}", position.y))
-                }
-            }
-            _ => None,
+        .label_formatter(move |pos| {
+            format_hover_label(pos, &pct_lookup, &unit, cursor_pct_scale, (y_min, y_max))
         });
 
     let mut interacted = false;
@@ -271,6 +297,7 @@ pub fn render_time_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_plot::PlotPoint;
 
     #[test]
     fn gap_splitting_breaks_on_sleep_pauses() {
@@ -279,5 +306,47 @@ mod tests {
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0], vec![[1.0, 5.0], [2.0, 6.0]]);
         assert_eq!(segs[1], vec![[15.0, 7.0], [16.0, 8.0]]);
+    }
+
+    #[test]
+    fn hover_label_formats_elsewhere_single_and_dual_axes() {
+        let mut pct_lookup = BTreeMap::new();
+        pct_lookup.insert("CPU busy (%)".to_string(), 0.05);
+
+        // Single axis (Power W), value only (no timestamp) and clamped to bounds
+        let p_watts = HoverPosition::Elsewhere {
+            position: PlotPoint::new(1_700_000_000.0, 18.425),
+        };
+        assert_eq!(
+            format_hover_label(&p_watts, &pct_lookup, " W", None, (0.0, 60.0)),
+            Some("18.43 W".to_string())
+        );
+
+        let p_neg = HoverPosition::Elsewhere {
+            position: PlotPoint::new(1_700_000_000.0, -0.3),
+        };
+        assert_eq!(
+            format_hover_label(&p_neg, &pct_lookup, " W", None, (0.0, 60.0)),
+            Some("0.00 W".to_string())
+        );
+
+        // Dual axis (GHz + busy %)
+        let p_cpu = HoverPosition::Elsewhere {
+            position: PlotPoint::new(1_700_000_000.0, 1.85),
+        };
+        assert_eq!(
+            format_hover_label(&p_cpu, &pct_lookup, " GHz", Some(0.05), (0.0, 5.0)),
+            Some("1.85 GHz · 37.0 %".to_string())
+        );
+
+        // NearDataPoint preserves series name + timestamp
+        let p_near = HoverPosition::NearDataPoint {
+            plot_name: "CPU busy (%)",
+            position: PlotPoint::new(1_700_000_000.0, 2.5),
+            index: 0,
+        };
+        let near_text = format_hover_label(&p_near, &pct_lookup, " GHz", Some(0.05), (0.0, 5.0))
+            .expect("near label");
+        assert!(near_text.starts_with("CPU busy (%): 50.0 %\n"));
     }
 }
