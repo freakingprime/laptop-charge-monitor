@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Maximum elapsed time between two energy counter samples before treating the
 /// interval as a sleep/pause gap and discarding the wattage reading.
@@ -13,6 +13,18 @@ pub const MAX_ZOOM_SPAN_SECS: f64 = 3.0 * 86_400.0;
 
 /// Minimum visible span (1 minute in seconds).
 pub const MIN_ZOOM_SPAN_SECS: f64 = 60.0;
+
+/// Default visible chart span on first launch (5 minutes in seconds).
+pub const DEFAULT_SPAN_SECS: f64 = 300.0;
+
+/// Default and minimum window dimensions (logical points).
+pub const DEFAULT_WINDOW_WIDTH: f32 = 1360.0;
+pub const DEFAULT_WINDOW_HEIGHT: f32 = 860.0;
+pub const MIN_WINDOW_WIDTH: f32 = 960.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 640.0;
+const MAX_WINDOW_DIM: f32 = 16_000.0;
+const MIN_VALID_WINDOW_COORD: f32 = -10_000.0;
+const MAX_VALID_WINDOW_COORD: f32 = 32_000.0;
 
 /// Threshold above which chart queries downsample raw 1s points.
 pub const DOWNSAMPLE_THRESHOLD_SECS: f64 = 1_800.0;
@@ -305,6 +317,326 @@ pub fn format_span_label(span_secs: f64) -> String {
     }
 }
 
+/// Persisted UI, chart viewport, and series visibility settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppSettings {
+    pub window_x: Option<f32>,
+    pub window_y: Option<f32>,
+    pub window_width: f32,
+    pub window_height: f32,
+    pub window_maximized: bool,
+    pub is_live: bool,
+    pub span_secs: f64,
+    pub paused_x_min: Option<f64>,
+    pub paused_x_max: Option<f64>,
+    pub hidden_series: BTreeSet<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            window_x: None,
+            window_y: None,
+            window_width: DEFAULT_WINDOW_WIDTH,
+            window_height: DEFAULT_WINDOW_HEIGHT,
+            window_maximized: false,
+            is_live: true,
+            span_secs: DEFAULT_SPAN_SECS,
+            paused_x_min: None,
+            paused_x_max: None,
+            hidden_series: BTreeSet::new(),
+        }
+    }
+}
+
+/// Validates a native outer window coordinate, filtering Windows `-32000` minimized values.
+pub fn is_valid_window_coord(v: f32) -> bool {
+    v.is_finite() && v > MIN_VALID_WINDOW_COORD && v < MAX_VALID_WINDOW_COORD
+}
+
+/// Sanitizes window width to valid minimum/maximum logical point bounds.
+pub fn sanitize_window_width(v: f32) -> f32 {
+    if v.is_finite() && v > 0.0 {
+        v.clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_DIM)
+    } else {
+        DEFAULT_WINDOW_WIDTH
+    }
+}
+
+/// Sanitizes window height to valid minimum/maximum logical point bounds.
+pub fn sanitize_window_height(v: f32) -> f32 {
+    if v.is_finite() && v > 0.0 {
+        v.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_DIM)
+    } else {
+        DEFAULT_WINDOW_HEIGHT
+    }
+}
+
+fn round_tenths(v: f32) -> f32 {
+    (v * 10.0).round() / 10.0
+}
+
+fn round_millis_f64(v: f64) -> f64 {
+    (v * 1_000.0).round() / 1_000.0
+}
+
+fn parse_bool_str(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn encode_string_set(set: &BTreeSet<String>) -> String {
+    if set.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, item) in set.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        for ch in item.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                ',' => out.push_str("\\,"),
+                _ => out.push(ch),
+            }
+        }
+    }
+    out
+}
+
+fn decode_string_set(raw: &str) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    if raw.is_empty() {
+        return set;
+    }
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            ',' => {
+                if !current.is_empty() {
+                    set.insert(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        set.insert(current);
+    }
+    set
+}
+
+impl AppSettings {
+    /// Returns a validated canonical copy suitable for dirty comparison and persistence.
+    pub fn canonical(&self) -> Self {
+        let (window_x, window_y) = match (self.window_x, self.window_y) {
+            (Some(x), Some(y)) if is_valid_window_coord(x) && is_valid_window_coord(y) => {
+                (Some(round_tenths(x)), Some(round_tenths(y)))
+            }
+            _ => (None, None),
+        };
+        let window_width = round_tenths(sanitize_window_width(self.window_width));
+        let window_height = round_tenths(sanitize_window_height(self.window_height));
+
+        let span_secs = if self.span_secs.is_finite() {
+            round_millis_f64(self.span_secs.clamp(MIN_ZOOM_SPAN_SECS, MAX_ZOOM_SPAN_SECS))
+        } else {
+            DEFAULT_SPAN_SECS
+        };
+
+        let (is_live, paused_x_min, paused_x_max) = if self.is_live {
+            (true, None, None)
+        } else if let (Some(x_min), Some(x_max)) = (self.paused_x_min, self.paused_x_max)
+            && x_min.is_finite()
+            && x_max.is_finite()
+            && x_max > x_min
+        {
+            (
+                false,
+                Some(round_millis_f64(x_min)),
+                Some(round_millis_f64(x_max)),
+            )
+        } else {
+            (true, None, None)
+        };
+
+        Self {
+            window_x,
+            window_y,
+            window_width,
+            window_height,
+            window_maximized: self.window_maximized,
+            is_live,
+            span_secs,
+            paused_x_min,
+            paused_x_max,
+            hidden_series: self.hidden_series.clone(),
+        }
+    }
+
+    /// Serializes settings into key-value pairs for the `app_settings` SQLite table.
+    pub fn to_kv_pairs(&self) -> Vec<(&'static str, String)> {
+        let s = self.canonical();
+        vec![
+            (
+                "window_x",
+                s.window_x.map(|v| format!("{v:.1}")).unwrap_or_default(),
+            ),
+            (
+                "window_y",
+                s.window_y.map(|v| format!("{v:.1}")).unwrap_or_default(),
+            ),
+            ("window_width", format!("{:.1}", s.window_width)),
+            ("window_height", format!("{:.1}", s.window_height)),
+            (
+                "window_maximized",
+                if s.window_maximized { "true" } else { "false" }.to_string(),
+            ),
+            (
+                "is_live",
+                if s.is_live { "true" } else { "false" }.to_string(),
+            ),
+            ("span_secs", format!("{:.3}", s.span_secs)),
+            (
+                "paused_x_min",
+                s.paused_x_min
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_default(),
+            ),
+            (
+                "paused_x_max",
+                s.paused_x_max
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_default(),
+            ),
+            ("hidden_series", encode_string_set(&s.hidden_series)),
+        ]
+    }
+
+    /// Reconstructs settings from stored key-value pairs, falling back safely on bad values.
+    pub fn from_kv_pairs<'a, I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut s = Self::default();
+        for (k, v) in iter {
+            match k {
+                "window_x" => {
+                    s.window_x = v
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|&x| is_valid_window_coord(x));
+                }
+                "window_y" => {
+                    s.window_y = v
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|&y| is_valid_window_coord(y));
+                }
+                "window_width" => {
+                    if let Ok(w) = v.trim().parse::<f32>()
+                        && w.is_finite()
+                        && w > 0.0
+                    {
+                        s.window_width = sanitize_window_width(w);
+                    }
+                }
+                "window_height" => {
+                    if let Ok(h) = v.trim().parse::<f32>()
+                        && h.is_finite()
+                        && h > 0.0
+                    {
+                        s.window_height = sanitize_window_height(h);
+                    }
+                }
+                "window_maximized" => {
+                    if let Some(b) = parse_bool_str(v) {
+                        s.window_maximized = b;
+                    }
+                }
+                "is_live" => {
+                    if let Some(b) = parse_bool_str(v) {
+                        s.is_live = b;
+                    }
+                }
+                "span_secs" => {
+                    if let Ok(span) = v.trim().parse::<f64>()
+                        && span.is_finite()
+                        && span > 0.0
+                    {
+                        s.span_secs = span.clamp(MIN_ZOOM_SPAN_SECS, MAX_ZOOM_SPAN_SECS);
+                    }
+                }
+                "paused_x_min" => {
+                    s.paused_x_min = v.trim().parse::<f64>().ok().filter(|x| x.is_finite());
+                }
+                "paused_x_max" => {
+                    s.paused_x_max = v.trim().parse::<f64>().ok().filter(|x| x.is_finite());
+                }
+                "hidden_series" => {
+                    s.hidden_series = decode_string_set(v);
+                }
+                _ => {}
+            }
+        }
+        s.canonical()
+    }
+}
+
+/// Resolves startup `(is_live, x_range)` from persisted settings.
+///
+/// Restores paused historical windows directly unless they fell completely outside the 7-day
+/// retention window, in which case it falls back to `LIVE` with the saved `span_secs`.
+pub fn resolve_startup_range(
+    settings: &AppSettings,
+    now_secs: f64,
+    retention_cutoff_secs: f64,
+) -> (bool, (f64, f64)) {
+    let saved_span = if settings.span_secs.is_finite() {
+        settings
+            .span_secs
+            .clamp(MIN_ZOOM_SPAN_SECS, MAX_ZOOM_SPAN_SECS)
+    } else {
+        DEFAULT_SPAN_SECS
+    };
+
+    if !settings.is_live
+        && let (Some(x_min), Some(x_max)) = (settings.paused_x_min, settings.paused_x_max)
+        && x_min.is_finite()
+        && x_max.is_finite()
+        && x_max > x_min
+        && x_max > retention_cutoff_secs
+    {
+        let raw_span = x_max - x_min;
+        let range = if (MIN_ZOOM_SPAN_SECS..=MAX_ZOOM_SPAN_SECS).contains(&raw_span) {
+            (x_min, x_max)
+        } else {
+            let clamped = raw_span.clamp(MIN_ZOOM_SPAN_SECS, MAX_ZOOM_SPAN_SECS);
+            let center = 0.5 * (x_min + x_max);
+            (center - 0.5 * clamped, center + 0.5 * clamped)
+        };
+        return (false, range);
+    }
+
+    (true, (now_secs - saved_span, now_secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +775,84 @@ mod tests {
             make(5_000, false),
         ];
         assert_eq!(compute_draining_on_charger_secs(&samples, 1_000, 5_000), 3);
+    }
+
+    #[test]
+    fn app_settings_kv_roundtrip_and_escaping() {
+        let mut hidden = BTreeSet::new();
+        hidden.insert("CPU power (W)".to_string());
+        hidden.insert("Sensor, 1\\2".to_string());
+
+        let original = AppSettings {
+            window_x: Some(-120.5),
+            window_y: Some(42.0),
+            window_width: 1440.0,
+            window_height: 900.0,
+            window_maximized: true,
+            is_live: false,
+            span_secs: 3_600.0,
+            paused_x_min: Some(1_700_000_000.125),
+            paused_x_max: Some(1_700_003_600.125),
+            hidden_series: hidden,
+        };
+
+        let pairs = original.to_kv_pairs();
+        let parsed = AppSettings::from_kv_pairs(pairs.iter().map(|(k, v)| (*k, v.as_str())));
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn app_settings_rejects_minimized_and_corrupt_values() {
+        let pairs = [
+            ("window_x", "-32000.0"),
+            ("window_y", "-32000.0"),
+            ("window_width", "200.0"),
+            ("window_height", "not_a_number"),
+            ("window_maximized", "maybe"),
+            ("is_live", "false"),
+            ("span_secs", "5.0"),
+            ("paused_x_min", ""),
+            ("paused_x_max", ""),
+            ("unknown_future_key", "42"),
+        ];
+        let parsed = AppSettings::from_kv_pairs(pairs);
+        assert_eq!(parsed.window_x, None);
+        assert_eq!(parsed.window_y, None);
+        assert_eq!(parsed.window_width, MIN_WINDOW_WIDTH);
+        assert_eq!(parsed.window_height, DEFAULT_WINDOW_HEIGHT);
+        assert!(!parsed.window_maximized);
+        // Paused without valid bounds falls back to LIVE mode cleanly.
+        assert!(parsed.is_live);
+        assert_eq!(parsed.span_secs, MIN_ZOOM_SPAN_SECS);
+    }
+
+    #[test]
+    fn startup_range_restores_paused_or_falls_back_after_retention() {
+        let now_secs = 2_000_000.0;
+        let cutoff_secs = now_secs - (7.0 * 86_400.0);
+
+        let paused_recent = AppSettings {
+            is_live: false,
+            span_secs: 900.0,
+            paused_x_min: Some(now_secs - 7_200.0),
+            paused_x_max: Some(now_secs - 6_300.0),
+            ..Default::default()
+        };
+        let (is_live, range) = resolve_startup_range(&paused_recent, now_secs, cutoff_secs);
+        assert!(!is_live);
+        assert!((range.0 - (now_secs - 7_200.0)).abs() < 1e-6);
+        assert!((range.1 - (now_secs - 6_300.0)).abs() < 1e-6);
+
+        let paused_expired = AppSettings {
+            is_live: false,
+            span_secs: 900.0,
+            paused_x_min: Some(cutoff_secs - 3_600.0),
+            paused_x_max: Some(cutoff_secs - 2_700.0),
+            ..Default::default()
+        };
+        let (is_live_fb, range_fb) = resolve_startup_range(&paused_expired, now_secs, cutoff_secs);
+        assert!(is_live_fb);
+        assert!((range_fb.1 - now_secs).abs() < 1e-6);
+        assert!((range_fb.1 - range_fb.0 - 900.0).abs() < 1e-6);
     }
 }

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, Result, params};
 
-use crate::model::TelemetrySample;
+use crate::model::{AppSettings, TelemetrySample};
 
 pub const RETENTION_DAYS_MS: i64 = 7 * 86_400_000;
 
@@ -28,6 +28,7 @@ impl TelemetryDb {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
 
             CREATE TABLE IF NOT EXISTS readings (
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +59,11 @@ impl TelemetryDb {
                 sensor_name TEXT    NOT NULL,
                 temp_c      REAL    NOT NULL,
                 PRIMARY KEY (reading_id, sensor_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             ",
         )?;
@@ -320,5 +326,32 @@ impl TelemetryDb {
         }
 
         Ok(samples)
+    }
+
+    pub fn load_settings(&self) -> Result<AppSettings> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM app_settings")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut pairs = Vec::new();
+        for row in rows {
+            pairs.push(row?);
+        }
+        Ok(AppSettings::from_kv_pairs(
+            pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        ))
+    }
+
+    pub fn save_settings(&mut self, settings: &AppSettings) -> Result<()> {
+        let pairs = settings.to_kv_pairs();
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )?;
+            for (key, value) in &pairs {
+                stmt.execute(params![key, value])?;
+            }
+        }
+        tx.commit()
     }
 }

@@ -12,6 +12,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
 use windows::core::w;
 
+use laptop_charge_monitor::model::{AppSettings, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
 use laptop_charge_monitor::sensors::SensorHub;
 use laptop_charge_monitor::storage::{RETENTION_DAYS_MS, TelemetryDb, resolve_db_path};
 use laptop_charge_monitor::ui::app::{LiveUpdate, PowerMonitorApp};
@@ -55,18 +56,22 @@ fn main() -> eframe::Result<()> {
     let db_display = db_path.to_string_lossy().into_owned();
     let meta = SensorHub::metadata(db_display);
 
-    // Initialize schema and perform startup 7-day retention prune before launching UI.
-    let initial_total = match TelemetryDb::open(&db_path) {
+    // Initialize schema, perform startup 7-day retention prune, and load persisted settings.
+    let (initial_total, initial_settings) = match TelemetryDb::open(&db_path) {
         Ok(db) => {
             let cutoff = Utc::now().timestamp_millis() - RETENTION_DAYS_MS;
             let _ = db.prune_older_than(cutoff);
-            db.total_count().unwrap_or(0)
+            (
+                db.total_count().unwrap_or(0),
+                db.load_settings().unwrap_or_default(),
+            )
         }
-        Err(_) => 0,
+        Err(_) => (0, AppSettings::default()),
     };
 
     let ui_db = TelemetryDb::open(&db_path).ok();
     let (tx, rx) = mpsc::channel::<LiveUpdate>();
+    let (settings_tx, settings_rx) = mpsc::channel::<AppSettings>();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_worker = Arc::clone(&shutdown);
     let base_ghz = meta.base_ghz;
@@ -75,11 +80,23 @@ fn main() -> eframe::Result<()> {
     let worker_slot = Arc::new(std::sync::Mutex::new(None));
     let worker_slot_cb = Arc::clone(&worker_slot);
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Power Monitor")
+        .with_inner_size([
+            initial_settings.window_width,
+            initial_settings.window_height,
+        ])
+        .with_min_inner_size([MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT]);
+    if let (Some(x), Some(y)) = (initial_settings.window_x, initial_settings.window_y) {
+        viewport = viewport.with_position([x, y]);
+    }
+    if initial_settings.window_maximized {
+        viewport = viewport.with_maximized(true);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Power Monitor")
-            .with_inner_size([1360.0, 860.0])
-            .with_min_inner_size([960.0, 640.0]),
+        viewport,
+        persist_window: false,
         ..Default::default()
     };
 
@@ -89,7 +106,14 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             let handle = thread::spawn(move || {
-                sampler_loop(base_ghz, &worker_db_path, tx, ctx, shutdown_worker);
+                sampler_loop(
+                    base_ghz,
+                    &worker_db_path,
+                    tx,
+                    settings_rx,
+                    ctx,
+                    shutdown_worker,
+                );
             });
             if let Ok(mut slot) = worker_slot_cb.lock() {
                 *slot = Some(handle);
@@ -99,7 +123,9 @@ fn main() -> eframe::Result<()> {
                 meta,
                 ui_db,
                 rx,
+                settings_tx,
                 initial_total,
+                initial_settings,
             )))
         }),
     );
@@ -114,10 +140,21 @@ fn main() -> eframe::Result<()> {
     run_res
 }
 
+fn flush_pending_settings(db: Option<&mut TelemetryDb>, settings_rx: &mpsc::Receiver<AppSettings>) {
+    let mut latest = None;
+    while let Ok(s) = settings_rx.try_recv() {
+        latest = Some(s);
+    }
+    if let (Some(db), Some(settings)) = (db, latest) {
+        let _ = db.save_settings(&settings);
+    }
+}
+
 fn sampler_loop(
     base_ghz: f64,
     db_path: &std::path::Path,
     tx: mpsc::Sender<LiveUpdate>,
+    settings_rx: mpsc::Receiver<AppSettings>,
     ctx: egui::Context,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -157,8 +194,9 @@ fn sampler_loop(
         }
         ctx.request_repaint();
 
-        // Sleep in 100ms increments up to 1s so window close terminates fast.
+        // Sleep in 100ms increments up to 1s so settings saves and window close stay responsive.
         while !shutdown.load(Ordering::Acquire) {
+            flush_pending_settings(writer_db.as_mut(), &settings_rx);
             let elapsed = tick_start.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 break;
@@ -167,4 +205,6 @@ fn sampler_loop(
             thread::sleep(remaining.min(Duration::from_millis(100)));
         }
     }
+
+    flush_pending_settings(writer_db.as_mut(), &settings_rx);
 }

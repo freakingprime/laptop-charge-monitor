@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Local};
 use egui::{Color32, RichText, Stroke, Ui, Vec2b};
@@ -150,7 +150,7 @@ pub fn render_time_chart(
     x_range: (f64, f64),
     force_x_bounds: bool,
     series: &[SeriesSpec],
-    hidden_series: &mut HashSet<String>,
+    hidden_series: &mut BTreeSet<String>,
     left_unit_suffix: &str,
 ) -> ChartOutput {
     ui.label(RichText::new(title).strong().size(13.0));

@@ -1,19 +1,23 @@
-use std::collections::HashSet;
-use std::sync::mpsc::Receiver;
+use std::collections::BTreeSet;
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, Ui};
 use egui_plot::{AxisHints, GridMark, HPlacement};
 
 use crate::model::{
-    DOWNSAMPLE_THRESHOLD_SECS, MAX_CHART_POINTS, MAX_ZOOM_SPAN_SECS, MIN_ZOOM_SPAN_SECS,
-    SystemMetadata, TelemetrySample, compute_draining_on_charger_secs, format_duration_compact,
-    format_span_label,
+    AppSettings, DOWNSAMPLE_THRESHOLD_SECS, MAX_CHART_POINTS, MAX_ZOOM_SPAN_SECS,
+    MIN_ZOOM_SPAN_SECS, SystemMetadata, TelemetrySample, compute_draining_on_charger_secs,
+    format_duration_compact, format_span_label, is_valid_window_coord, resolve_startup_range,
+    sanitize_window_height, sanitize_window_width,
 };
-use crate::storage::TelemetryDb;
+use crate::storage::{RETENTION_DAYS_MS, TelemetryDb};
 use crate::ui::charts::{
     SeriesSpec, collect_temp_series, render_time_chart, split_segments_by_gap,
 };
+
+const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub struct LiveUpdate {
     pub sample: TelemetrySample,
@@ -43,6 +47,7 @@ pub struct PowerMonitorApp {
     meta: SystemMetadata,
     db: Option<TelemetryDb>,
     rx: Receiver<LiveUpdate>,
+    settings_tx: Sender<AppSettings>,
 
     latest: Option<TelemetrySample>,
     total_readings: i64,
@@ -55,7 +60,15 @@ pub struct PowerMonitorApp {
     loaded_range_ms: (i64, i64),
     loaded_downsampled: bool,
     last_db_refresh_secs: f64,
-    hidden_series: HashSet<String>,
+    hidden_series: BTreeSet<String>,
+
+    window_x: Option<f32>,
+    window_y: Option<f32>,
+    window_width: f32,
+    window_height: f32,
+    window_maximized: bool,
+    last_persisted_settings: AppSettings,
+    pending_settings: Option<(AppSettings, Instant)>,
 }
 
 impl PowerMonitorApp {
@@ -64,28 +77,42 @@ impl PowerMonitorApp {
         meta: SystemMetadata,
         db: Option<TelemetryDb>,
         rx: Receiver<LiveUpdate>,
+        settings_tx: Sender<AppSettings>,
         initial_total: i64,
+        initial_settings: AppSettings,
     ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::light());
 
-        let now_secs = Utc::now().timestamp_millis() as f64 / 1_000.0;
-        let x_range = (now_secs - PresetSpan::FiveMin.secs(), now_secs);
+        let canonical_settings = initial_settings.canonical();
+        let now_ms = Utc::now().timestamp_millis();
+        let now_secs = now_ms as f64 / 1_000.0;
+        let retention_cutoff_secs = (now_ms - RETENTION_DAYS_MS) as f64 / 1_000.0;
+        let (is_live, x_range) =
+            resolve_startup_range(&canonical_settings, now_secs, retention_cutoff_secs);
 
         let mut app = Self {
             meta,
             db,
             rx,
+            settings_tx,
             latest: None,
             total_readings: initial_total,
             samples: Vec::new(),
             draining_visible_secs: 0,
-            is_live: true,
+            is_live,
             force_x_bounds_frames: 2,
             x_range,
             loaded_range_ms: (0, 0),
             loaded_downsampled: false,
             last_db_refresh_secs: 0.0,
-            hidden_series: HashSet::new(),
+            hidden_series: canonical_settings.hidden_series.clone(),
+            window_x: canonical_settings.window_x,
+            window_y: canonical_settings.window_y,
+            window_width: canonical_settings.window_width,
+            window_height: canonical_settings.window_height,
+            window_maximized: canonical_settings.window_maximized,
+            last_persisted_settings: canonical_settings,
+            pending_settings: None,
         };
         app.reload_window_from_db();
         app.latest = app.samples.last().cloned();
@@ -614,11 +641,109 @@ impl PowerMonitorApp {
             self.maybe_reload_for_pan_zoom();
         }
     }
+
+    fn capture_window_geometry(&mut self, ctx: &egui::Context) {
+        let vp = ctx.input(|i| i.viewport().clone());
+        if vp.minimized == Some(true) {
+            return;
+        }
+        if let Some(maximized) = vp.maximized {
+            self.window_maximized = maximized;
+            if maximized {
+                // Keep the last normal (unmaximized) position and size for restore.
+                return;
+            }
+        } else if self.window_maximized {
+            return;
+        }
+        if let Some(outer) = vp.outer_rect
+            && is_valid_window_coord(outer.min.x)
+            && is_valid_window_coord(outer.min.y)
+        {
+            self.window_x = Some(outer.min.x);
+            self.window_y = Some(outer.min.y);
+        }
+        if let Some(inner) = vp.inner_rect
+            && inner.width() >= 100.0
+            && inner.height() >= 100.0
+        {
+            self.window_width = sanitize_window_width(inner.width());
+            self.window_height = sanitize_window_height(inner.height());
+        }
+    }
+
+    fn current_settings(&self) -> AppSettings {
+        let span_secs =
+            (self.x_range.1 - self.x_range.0).clamp(MIN_ZOOM_SPAN_SECS, MAX_ZOOM_SPAN_SECS);
+        AppSettings {
+            window_x: self.window_x,
+            window_y: self.window_y,
+            window_width: self.window_width,
+            window_height: self.window_height,
+            window_maximized: self.window_maximized,
+            is_live: self.is_live,
+            span_secs,
+            paused_x_min: if self.is_live {
+                None
+            } else {
+                Some(self.x_range.0)
+            },
+            paused_x_max: if self.is_live {
+                None
+            } else {
+                Some(self.x_range.1)
+            },
+            hidden_series: self.hidden_series.clone(),
+        }
+        .canonical()
+    }
+
+    fn flush_settings(&mut self, settings: AppSettings) {
+        if self.settings_tx.send(settings.clone()).is_ok() {
+            self.last_persisted_settings = settings;
+        }
+        self.pending_settings = None;
+    }
+
+    fn sync_settings(&mut self, ctx: &egui::Context) {
+        let current = self.current_settings();
+        if current == self.last_persisted_settings {
+            self.pending_settings = None;
+            return;
+        }
+
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.flush_settings(current);
+            return;
+        }
+
+        if let Some((pending, dirty_since)) = &self.pending_settings
+            && *pending == current
+        {
+            if dirty_since.elapsed() >= SETTINGS_SAVE_DEBOUNCE {
+                self.flush_settings(current);
+            }
+            return;
+        }
+
+        self.pending_settings = Some((current, Instant::now()));
+        ctx.request_repaint_after(SETTINGS_SAVE_DEBOUNCE + Duration::from_millis(20));
+    }
+}
+
+impl Drop for PowerMonitorApp {
+    fn drop(&mut self) {
+        let current = self.current_settings();
+        if current != self.last_persisted_settings || self.pending_settings.is_some() {
+            self.flush_settings(current);
+        }
+    }
 }
 
 impl eframe::App for PowerMonitorApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_live_updates();
+        self.capture_window_geometry(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -631,6 +756,7 @@ impl eframe::App for PowerMonitorApp {
                 ui.add_space(4.0);
                 self.render_charts(ui);
             });
+        self.sync_settings(ui.ctx());
     }
 }
 
