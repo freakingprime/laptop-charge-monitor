@@ -1,7 +1,15 @@
+[workspace]
+members = [".", "xtask"]
+default-members = ["."]
+
 [package]
 name = "laptop-charge-monitor"
 version = "0.1.0"
 edition = "2024"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
 
 [lib]
 name = "laptop_charge_monitor"
